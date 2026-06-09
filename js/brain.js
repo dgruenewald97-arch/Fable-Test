@@ -2,7 +2,9 @@
 // Spricht die OpenAI-kompatible API (funktioniert auch mit LM Studio).
 // Alles asynchron mit Prioritäts-Queue; regelbasierte Fallbacks halten
 // die Welt am Leben, wenn das Modell nicht erreichbar oder ausgelastet ist.
-import { pick, chance } from './util.js';
+import { pick, chance, JOB_LABEL } from './util.js';
+
+const JOBHINT = p => JOB_LABEL[p.job] || 'Dorfbewohner';
 
 const FALLBACK_THOUGHTS = {
   hunger: ['Mein Magen knurrt schon wieder…', 'Ich brauche dringend etwas zu essen.', 'Hoffentlich gibt es heute genug Beeren.'],
@@ -111,20 +113,32 @@ export class Brain {
     return text;
   }
 
+  // Für kleine Modelle (3B): kurze System-Prompts, wenig Kontext, Beispiele.
   baseSystem(p, sim) {
-    return `Du bist ${p.describe()}. Du lebst in einer einfachen, frühen Welt (Jahr ${sim.year}) ohne moderne Technik. Antworte immer auf Deutsch, knapp und in deiner Rolle.`;
+    return `Du bist ${p.name}, ${Math.floor(p.age)} Jahre, ${p.traits.join(' und ')}. Du lebst in einem einfachen Dorf in alter Zeit. Antworte NUR auf Deutsch. Antworte NUR mit dem, was verlangt wird — keine Erklärungen, keine Anführungszeichen, kein Englisch.`;
   }
 
-  contextOf(p, sim) {
+  contextOf(p, sim, maxMems = 2) {
     const parts = [];
     if (p.hunger > 60) parts.push('Du hast Hunger.');
     if (p.energy < 30) parts.push('Du bist erschöpft.');
     if (p.disease === 'sick') parts.push('Du bist krank und hast Fieber.');
     if (p.village && p.village.stock.food < p.village.pop) parts.push('Die Vorräte deines Dorfes sind knapp.');
-    const mems = p.recentMemories(4).map(m => '- ' + m.text);
-    if (mems.length) parts.push('Deine Erinnerungen:\n' + mems.join('\n'));
-    if (p.whisper) parts.push(`Eine geheimnisvolle innere Stimme hat dir zugeflüstert: "${p.whisper}"`);
+    const mems = p.recentMemories(maxMems).map(m => `Du erinnerst dich: ${m.text}`);
+    parts.push(...mems);
+    if (p.whisper) parts.push(`Eine geheimnisvolle Stimme hat dir zugeflüstert: "${p.whisper}"`);
     return parts.join('\n');
+  }
+
+  // Antwort eines kleinen Modells aufräumen: Präfixe, Quotes, Markdown weg, ein Satz
+  cleanLine(text, maxLen = 160) {
+    let t = (text || '').split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
+    t = t.replace(/^(Gedanke|Antwort|Satz|Ich denke|Reaktion|Gerücht)\s*:\s*/i, '');
+    t = t.replace(/[*_#`]/g, '').replace(/^["'„»\s]+|["'“«\s]+$/g, '');
+    // nach dem ersten Satzende abschneiden (lässt …, !, ? zu)
+    const m = t.match(/^.+?[.!?…](?=\s|$)/);
+    if (m && m[0].length > 12) t = m[0];
+    return t.slice(0, maxLen);
   }
 
   fallbackThought(p) {
@@ -141,10 +155,11 @@ export class Brain {
     this.enqueue({
       priority,
       system: this.baseSystem(p, sim),
-      user: `${this.contextOf(p, sim)}\n\nSchreibe deinen aktuellen Gedanken: GENAU EIN kurzer Satz in Ich-Form. Nur den Gedanken, nichts anderes.`,
-      maxTokens: 60,
+      user: `${this.contextOf(p, sim)}\n\nSchreibe deinen aktuellen Gedanken. GENAU EIN kurzer Satz, Ich-Form.\nBeispiel: Ich hoffe, der Winter wird mild.\nDein Gedanke:`,
+      maxTokens: 50,
       onResult: text => {
-        const t = text.split('\n')[0].replace(/^["'\s]+|["'\s]+$/g, '').slice(0, 160);
+        const t = this.cleanLine(text);
+        if (!t || t.length < 4) { p.currentThought = this.fallbackThought(p); p.thoughtIsAI = false; return; }
         p.currentThought = t; p.thoughtIsAI = true;
         p.addMemory('Gedanke: ' + t, 2, sim.tick);
         if (p.whisper) { p.addMemory(`Die innere Stimme sprach zu mir: "${p.whisper}"`, 9, sim.tick); p.whisper = null; }
@@ -160,15 +175,18 @@ export class Brain {
     const beliefTxt = beliefs.length ? `${a.name} glaubt: "${beliefs[0].text}"` : '';
     this.enqueue({
       priority: 2,
-      system: `Du schreibst kurze Dialoge zwischen einfachen Dorfbewohnern in einer frühen Welt. Immer auf Deutsch.`,
-      user: `Person A: ${a.describe()}\nPerson B: ${b.describe()}\n${relTxt} ${beliefTxt}\nAktuelle Lage: ${this.contextOf(a, sim) || 'ein normaler Tag'}\n\nSchreibe einen kurzen Dialog mit GENAU 4 Zeilen im Format "NAME: Satz". Danach eine letzte Zeile "STIMMUNG: +1" (freundlich), "STIMMUNG: 0" (neutral) oder "STIMMUNG: -1" (streit).`,
-      maxTokens: 200,
+      system: `Du schreibst sehr kurze Dialoge zwischen Dorfbewohnern in alter Zeit. NUR Deutsch. Halte dich GENAU an das Format.`,
+      user: `${a.name}: ${a.traits.join(', ')}, ${JOBHINT(a)}\n${b.name}: ${b.traits.join(', ')}, ${JOBHINT(b)}\n${relTxt} ${beliefTxt}\nLage: ${this.contextOf(a, sim, 1) || 'ein normaler Tag'}\n\nSchreibe 4 Dialogzeilen und eine Stimmungszeile. Format-Beispiel:\n${a.name}: Schöner Morgen heute.\n${b.name}: Ja, aber die Arbeit ruft.\n${a.name}: Hast du das Neueste gehört?\n${b.name}: Erzähl!\nSTIMMUNG: +1\n\n(STIMMUNG: +1 = freundlich, 0 = neutral, -1 = Streit)\nDein Dialog:`,
+      maxTokens: 180,
       onResult: text => {
-        const lines = text.split('\n').map(l => l.trim()).filter(l => /^[^:]{2,24}:\s?.+/.test(l) && !/^STIMMUNG/i.test(l)).slice(0, 4);
+        const lines = text.split('\n').map(l => l.trim().replace(/[*_#`]/g, ''))
+          .filter(l => /^[^:]{2,24}:\s?.+/.test(l) && !/^(STIMMUNG|Lage|Format)/i.test(l)).slice(0, 4);
         let mood = 0;
-        const mm = text.match(/STIMMUNG:\s*([+-]?\d)/i);
-        if (mm) mood = Math.sign(parseInt(mm[1], 10) || 0);
-        done(lines.length ? lines : null, mood, true);
+        const mm = text.match(/STIMMUNG\s*:?\s*([+-]?\s*\d)/i);
+        if (mm) mood = Math.sign(parseInt(mm[1].replace(/\s/g, ''), 10) || 0);
+        else if (/streit|wütend|zornig|hasse/i.test(text)) mood = -1;
+        else mood = 1;
+        done(lines.length >= 2 ? lines : null, mood, lines.length >= 2);
       },
       fallback: () => done(null, chance(0.7) ? 1 : 0, false),
     });
@@ -179,11 +197,13 @@ export class Brain {
     this.enqueue({
       priority: 2,
       system: this.baseSystem(leader, sim),
-      user: `Du bist Anführer von ${ownV.name} (${ownV.pop} Einwohner, Vorräte: ${Math.floor(ownV.stock.food)} Essen). Das Verhältnis zum Dorf ${targetV.name} ist feindselig. ${this.contextOf(leader, sim)}\n\nSollen deine Krieger ${targetV.name} überfallen? Bedenke Risiko und deinen Charakter. Antworte mit GENAU einer Zeile: zuerst "JA" oder "NEIN", dann ein Komma und eine kurze Begründung.`,
-      maxTokens: 70,
+      user: `Du bist Anführer des Dorfes ${ownV.name} (${ownV.pop} Einwohner). Das Nachbardorf ${targetV.name} ist euer Feind. ${this.contextOf(leader, sim, 1)}\n\nGreifst du ${targetV.name} an? Antworte in GENAU diesem Format:\nJA, weil <kurzer Grund>\noder\nNEIN, weil <kurzer Grund>\nDeine Antwort:`,
+      maxTokens: 60,
       onResult: text => {
-        const yes = /^\s*"?\s*JA\b/i.test(text);
-        const reason = text.replace(/^[^,]*,?\s*/, '').slice(0, 140);
+        const t = text.trim();
+        const yes = /\bJA\b/i.test(t.slice(0, 20)) && !/\bNEIN\b/i.test(t.slice(0, 20));
+        const rm = t.match(/weil\s+(.{4,140})/i);
+        const reason = this.cleanLine(rm ? rm[1] : t.replace(/^[^,]*,?\s*/, ''), 140);
         done(yes, reason, true);
       },
       fallback: () => {
@@ -200,14 +220,19 @@ export class Brain {
       : p.has('misstrauisch')
         ? 'Du vermutest eine Verschwörung — jemand steckt dahinter.'
         : 'Du spekulierst wild, wer oder was dahintersteckt.';
-    const targetTxt = targetVillage ? ` Wenn du jemanden beschuldigst, dann das Dorf ${targetVillage.name}.` : '';
+    const targetTxt = targetVillage ? ` Beschuldige das Dorf ${targetVillage.name}.` : '';
     this.enqueue({
       priority: 3,
       system: this.baseSystem(p, sim),
-      user: `Folgendes ist geschehen: ${eventText}\n${angle}${targetTxt}\n\nErfinde das Gerücht, das du nun verbreitest: GENAU EIN Satz in wörtlicher Rede, dramatisch und glaubhaft für einfache Leute. Nur der Satz.`,
-      maxTokens: 70,
+      user: `Es ist geschehen: ${eventText}.\n${angle}${targetTxt}\n\nErfinde das Gerücht, das du verbreitest. GENAU EIN dramatischer Satz.\nBeispiel: Die Götter haben uns gestraft, weil jemand den heiligen Stein berührt hat!\nDein Gerücht:`,
+      maxTokens: 60,
       onResult: text => {
-        const t = text.split('\n')[0].replace(/^["'\s]+|["'\s]+$/g, '').slice(0, 180);
+        const t = this.cleanLine(text, 180);
+        if (!t || t.length < 8) {
+          const tpl = targetVillage ? pick(FALLBACK_BLAME) : pick(FALLBACK_RUMORS);
+          done(tpl.replace('{EVENT}', eventText).replace('{TARGET}', targetVillage ? targetVillage.name : ''), false);
+          return;
+        }
         done(t, true);
       },
       fallback: () => {
@@ -223,10 +248,11 @@ export class Brain {
     this.enqueue({
       priority: 1,
       system: this.baseSystem(p, sim),
-      user: `${this.contextOf(p, sim)}\n\nEine übernatürliche Stimme in deinem Kopf hat gerade zu dir gesprochen: "${text}"\nWie reagierst du innerlich? GENAU EIN Satz in Ich-Form. Nimm die Stimme ernst${p.has('skeptisch') ? ', auch wenn du zweifelst' : ''}.`,
-      maxTokens: 70,
+      user: `Eine übernatürliche Stimme in deinem Kopf hat gerade zu dir gesprochen: "${text}"\nWie reagierst du innerlich? GENAU EIN Satz, Ich-Form. Nimm die Stimme ernst${p.has('skeptisch') ? ', auch wenn du zweifelst' : ''}.\nBeispiel: Die Götter sprechen zu mir — ich muss handeln!\nDeine Reaktion:`,
+      maxTokens: 60,
       onResult: out => {
-        const t = out.split('\n')[0].replace(/^["'\s]+|["'\s]+$/g, '').slice(0, 160);
+        const t = this.cleanLine(out);
+        if (!t || t.length < 4) { done(p.has('fromm') ? 'Die Götter haben zu mir gesprochen!' : 'Was war das für eine Stimme…?', false); return; }
         done(t, true);
       },
       fallback: () => done(p.has('fromm') ? 'Die Götter haben zu mir gesprochen! Ich muss gehorchen.' : 'Was war das?! Eine Stimme… in meinem Kopf…', false),
